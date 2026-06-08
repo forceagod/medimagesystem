@@ -12,6 +12,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 # Fields whose extracted values are prone to semantic errors
 HIGH_RISK_FIELDS = [
@@ -23,11 +24,40 @@ HIGH_RISK_FIELDS = [
 ]
 
 # How many chars of protocol context to capture around evidence
-CONTEXT_WINDOW = 2000
+CONTEXT_WINDOW = 1000
 
 
 def norm(value: str) -> str:
     return re.sub(r"[\s　：:,。；;()()、/\\_\-]+", "", str(value)).lower()
+
+
+def _extract_xml_text_with_ins(element: Any) -> str:
+    """Extract text from a docx XML element, including tracked insertions (w:ins)
+    but excluding tracked deletions (w:del)."""
+    from lxml import etree
+
+    text_parts: list[str] = []
+
+    def _walk(el):
+        tag = etree.QName(el).localname if isinstance(el.tag, str) else ""
+        if tag == "del":
+            return
+        if tag == "ins":
+            for child in el:
+                _walk(child)
+            return
+        if tag == "t":
+            txt = el.text or ""
+            if txt:
+                text_parts.append(txt)
+            return
+        if tag in ("rPr", "pPr", "pBdr", "tblPr", "tcPr", "trPr", "tblGrid"):
+            return
+        for child in el:
+            _walk(child)
+
+    _walk(element)
+    return "".join(text_parts)
 
 
 def read_protocol_text(protocol_path: Path) -> str:
@@ -37,12 +67,12 @@ def read_protocol_text(protocol_path: Path) -> str:
         doc = Document(protocol_path)
         parts: list[str] = []
         for para in doc.paragraphs:
-            text = para.text.strip()
+            text = _extract_xml_text_with_ins(para._element).strip()
             if text:
                 parts.append(text)
         for table in doc.tables:
             for row in table.rows:
-                cells = [cell.text.strip() for cell in row.cells]
+                cells = [_extract_xml_text_with_ins(cell._tc).strip() for cell in row.cells]
                 cells = [c for c in cells if c]
                 if cells:
                     parts.append(" | ".join(cells))
@@ -74,9 +104,13 @@ def find_evidence_span(full_text: str, evidence_snippet: str, window: int = CONT
     return full_text[start:end]
 
 
-def cmd_prepare(trace_path: Path, protocol_path: Path, out_path: Path) -> None:
+def cmd_prepare(trace_path: Path, protocol_path: Path, protocol_text_path: Path | None, out_path: Path) -> None:
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
-    protocol_text = read_protocol_text(protocol_path)
+    # Prefer pre-dumped text file (fast) over re-parsing docx (slow).
+    if protocol_text_path:
+        protocol_text = protocol_text_path.read_text(encoding="utf-8")
+    else:
+        protocol_text = read_protocol_text(protocol_path)
     items = trace.get("items", [])
 
     review_items: list[dict] = []
@@ -157,16 +191,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Semantic review of high-risk DMP trace fields")
     parser.add_argument("--mode", required=True, choices=["prepare", "apply"])
     parser.add_argument("--trace", required=True, type=Path, help="dmp_trace.json path")
-    parser.add_argument("--protocol", type=Path, help="protocol docx (required for prepare)")
+    parser.add_argument("--protocol", type=Path, help="protocol docx/pdf (for semantic review context)")
+    parser.add_argument("--protocol-text", type=Path, help="pre-dumped protocol text file (fast path)")
     parser.add_argument("--review", type=Path, help="review JSON path")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
     if args.mode == "prepare":
-        if not args.protocol:
-            raise SystemExit("--protocol is required for prepare mode")
+        if not args.protocol and not args.protocol_text:
+            raise SystemExit("--protocol or --protocol-text is required for prepare mode")
         review_out = args.out
-        cmd_prepare(args.trace, args.protocol, review_out)
+        cmd_prepare(args.trace, args.protocol, args.protocol_text, review_out)
     else:
         review_in = args.review or args.out
         cmd_apply(review_in, args.trace, args.out)

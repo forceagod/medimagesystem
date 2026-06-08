@@ -21,6 +21,7 @@ CHECKLIST_COLUMNS = [
     "需要填写/替换的具体内容",
     "来源类型",
     "缺失时处理",
+    "适用条件",
 ]
 
 PROTECTED_TABLE_LIKE_SECTIONS = ["9", "15.2", "26.1", "27.1", "27.2", "27.3", "29"]
@@ -66,6 +67,21 @@ VERSION_RECORD_ALIASES = {
     "撰写者/修订者": ["撰写者/修订者", "撰写者修订者", "撰写者", "修订者"],
     "版本修订内容": ["版本修订记录", "版本修订内容", "修订内容", "修订记录"],
 }
+
+SIGNER_FIELD_ALIASES = {
+    "撰写人": ["撰写人", "撰写者", "撰写者/修订者", "撰写者修订者"],
+    "数据管理单位审核人": ["数据管理单位审核人", "数据管理审核人", "DM审核人"],
+    "申办者审核人": ["申办者审核人", "申办方审核人", "申办者复核人"],
+    "CRO审核人": ["CRO审核人", "临床监查方审核人", "临床监察方审核人", "监查方审核人", "项目经理"],
+    "统计分析单位审核人": ["统计分析单位审核人", "统计分析方审核人", "统计师审核人", "统计审核人"],
+}
+
+SIGNER_KEY_ORDER = [
+    ("key 1", "数据管理单位审核人"),
+    ("key 2", "申办者审核人"),
+    ("key 3", "CRO审核人"),
+    ("key 4", "统计分析单位审核人"),
+]
 
 
 def norm(value: Any) -> str:
@@ -120,18 +136,48 @@ def load_xlsx_rows(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _extract_xml_text_with_ins(element: Any) -> str:
+    """Extract text from a docx XML element, including tracked insertions (w:ins)
+    but excluding tracked deletions (w:del)."""
+    from lxml import etree
+
+    NSMAP = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    text_parts: list[str] = []
+
+    def _walk(el):
+        tag = etree.QName(el).localname if isinstance(el.tag, str) else ""
+        if tag == "del":
+            return
+        if tag == "ins":
+            for child in el:
+                _walk(child)
+            return
+        if tag == "t":
+            txt = el.text or ""
+            if txt:
+                text_parts.append(txt)
+            return
+        if tag in ("rPr", "pPr", "pBdr", "tblPr", "tcPr", "trPr", "tblGrid"):
+            return
+        for child in el:
+            _walk(child)
+
+    _walk(element)
+    return "".join(text_parts)
+
+
 def read_docx_text(path: Path) -> tuple[str, list[str]]:
     from docx import Document
 
     doc = Document(path)
     lines: list[str] = []
     for para in doc.paragraphs:
-        text = para.text.strip()
+        text = _extract_xml_text_with_ins(para._element).strip()
         if text:
             lines.append(text)
     for table_index, table in enumerate(doc.tables):
         for row_index, row in enumerate(table.rows):
-            cells = [cell.text.strip() for cell in row.cells]
+            cells = [_extract_xml_text_with_ins(cell._tc).strip() for cell in row.cells]
             cells = [cell for cell in cells if cell]
             if cells:
                 lines.append(f"[表{table_index + 1} 行{row_index + 1}] " + " | ".join(cells))
@@ -294,6 +340,86 @@ def extract_version_records(data: Any) -> list[dict[str, str]]:
             deduped.append(record)
     deduped.sort(key=_version_sort_key)
     return deduped
+
+
+def signer_alias_norms() -> set[str]:
+    aliases: list[str] = ["撰写人"]
+    for role_key, role_aliases in SIGNER_FIELD_ALIASES.items():
+        if role_key != "撰写人":
+            aliases.extend(role_aliases)
+    return {norm(alias) for alias in aliases}
+
+
+def collect_signature_signers(mapping: dict[str, Any]) -> dict[str, str] | None:
+    """Collect flat signer fields, with legacy nested signer-object fallback."""
+    alias_norms = signer_alias_norms()
+    found_signer_field = False
+    signers: dict[str, str] = {}
+
+    for key, raw_value in mapping.items():
+        if isinstance(raw_value, (dict, list)):
+            continue
+        if norm(key) in alias_norms:
+            found_signer_field = True
+            signers[str(key).strip()] = as_text(raw_value)
+
+    signer_block = mapping.get("签署页签署人")
+    if isinstance(signer_block, dict):
+        found_signer_field = True
+        for key, raw_value in signer_block.items():
+            text_key = str(key).strip()
+            signers.setdefault(text_key, as_text(raw_value))
+
+    if found_signer_field:
+        return signers
+    return None
+
+
+def extract_signature_signers(data: Any) -> dict[str, str]:
+    """Find current DM-log signature signer fields."""
+
+    def visit(value: Any) -> dict[str, str] | None:
+        if isinstance(value, dict):
+            hit = collect_signature_signers(value)
+            if hit is not None:
+                return hit
+            for child in value.values():
+                hit = visit(child)
+                if hit is not None:
+                    return hit
+        elif isinstance(value, list):
+            for child in reversed(value):
+                hit = visit(child)
+                if hit is not None:
+                    return hit
+        return None
+
+    return visit(data) or {}
+
+
+def normalize_signers(raw_signers: dict[str, str]) -> dict[str, Any]:
+    """Map DM-log signer names to the signature-page placeholder keys."""
+
+    def lookup(role_key: str) -> str | None:
+        aliases = SIGNER_FIELD_ALIASES.get(role_key, [role_key])
+        alias_norms = {norm(alias) for alias in aliases}
+        for key, value in raw_signers.items():
+            if value and norm(key) in alias_norms:
+                return as_text(value)
+        return None
+
+    reviewers: dict[str, dict[str, str]] = {}
+    for placeholder_key, role_name in SIGNER_KEY_ORDER:
+        reviewers[placeholder_key] = {
+            "role": role_name,
+            "name": lookup(role_name) or "",
+        }
+
+    return {
+        "writer": lookup("撰写人") or "",
+        "reviewers": reviewers,
+        "raw": dict(raw_signers),
+    }
 
 
 def select_template_from_dm(dm_flat: dict[str, str], template_dir: Path) -> dict[str, Any]:
@@ -531,6 +657,20 @@ def protocol_title(lines: list[str]) -> tuple[str | None, list[str]]:
     return None, []
 
 
+def normalize_version(value: str | None) -> str | None:
+    """Normalize version string to uppercase V prefix: v4.0→V4.0, 1.3→V1.3, V1.0→V1.0."""
+    if not value:
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    if stripped[0].lower() == "v":
+        return f"V{stripped[1:]}"
+    if stripped[0].isdigit():
+        return f"V{stripped}"
+    return value
+
+
 def filename_version(path: Path | None) -> tuple[str | None, list[str]]:
     if not path:
         return None, []
@@ -544,10 +684,17 @@ def filename_version(path: Path | None) -> tuple[str | None, list[str]]:
 def filename_version_date(path: Path | None) -> tuple[str | None, list[str]]:
     if not path:
         return None, []
+    # Try separated: 2024-01-11, 2024.01.11, 2024年01月11日
     match = re.search(r"(\d{4})[-_.年](\d{1,2})[-_.月](\d{1,2})", path.stem)
     if not match:
+        # Try unseparated: 20240111 (8 consecutive digits)
+        match = re.search(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)", path.stem)
+    if not match:
         return None, []
-    value = f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    y, m, d = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    if not (1 <= m <= 12 and 1 <= d <= 31):
+        return None, []
+    value = f"{y:04d}-{m:02d}-{d:02d}"
     return value, [f"方案文件名 `{path.name}` 提供方案版本日期线索：{value}"]
 
 
@@ -582,13 +729,15 @@ def protocol_lookup(item: str, text: str, lines: list[str], protocol_path: Path 
     if item == "方案版本号":
         value, evidence = first_regex(
             [
-                r"(?:方案)?版本(?:号)?(?:和日期)?[：:]\s*(V?\d+(?:\.\d+)+)",
-                r"(?:方案)?版本(?:号)?(?:和日期)?[：:]\s*(V?\d+(?:\.\d+)*)",
-                r"Version\s*[:：]?\s*(V?\d+(?:\.\d+)*)",
+                r"(?:方案)?版本(?:号)?(?:[和及与/、]?(?:版本)?日期)?[：:]\s*(?:\|\s*)?([Vv]?\d+(?:\.\d+)+)",
+                r"(?:方案)?版本(?:号)?(?:[和及与/、]?(?:版本)?日期)?[：:]\s*(?:\|\s*)?([Vv]?\d+(?:\.\d+)*)",
+                r"Version\s*[:：]?\s*([Vv]?\d+(?:\.\d+)*)",
             ],
             text,
         )
+        value = normalize_version(value)
         filename_value, filename_evidence = filename_version(protocol_path)
+        filename_value = normalize_version(filename_value)
         if filename_value and (not value or looks_like_partial_version(value, filename_value)):
             return result_from_value(filename_value, filename_evidence + evidence, confident=True)
         if value and filename_value and norm(value) != norm(filename_value):
@@ -602,23 +751,34 @@ def protocol_lookup(item: str, text: str, lines: list[str], protocol_path: Path 
     if item == "方案版本日期":
         value, evidence = first_regex(
             [
+                # Combined version+date: 方案版本号和日期：V1.0/2025.11.24   or  版本号/版本日期：v4.0/2023-05-23
+                r"(?:方案)?版本(?:号)?(?:和|及|与|\/|、)(?:版本)?日期[：:]\s*(?:V?\d+(?:\.\d+)*[/\\,;；，、]\s*)?([0-9]{4}[-./年][0-9]{1,2}[-./月][0-9]{1,2}日?)",
+                # Standalone: 方案版本日期：2025.11.24
                 r"(?:方案)?版本日期[：:]\s*([0-9]{4}[-./年][0-9]{1,2}[-./月][0-9]{1,2}日?)",
-                r"(?:日期|签署日期)[：:]\s*([0-9]{4}[-./年][0-9]{1,2}[-./月][0-9]{1,2}日?)",
+                # Table cell: V1.1，2024年9月2日 (date after version in same cell)
+                r"(?:V\d+(?:\.\d+)*[/\\,;；，、]\s*)?([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日)",
+                # Bare date near 方案: 方案...日期：2025.11.24
+                r"(?:方案)(?:.{0,8}?)(?:日期)[：:]\s*([0-9]{4}[-./年][0-9]{1,2}[-./月][0-9]{1,2}日?)",
             ],
             text,
         )
         filename_value, filename_evidence = filename_version_date(protocol_path)
-        if filename_value and not value:
-            return result_from_value(filename_value, filename_evidence, confident=True)
         if value:
             normalized_value = normalize_date_value(value)
+            result = result_from_value(normalized_value, evidence, confident=True)
             if filename_value and normalized_value != filename_value:
-                return {
-                    "status": "conflict",
-                    "value": None,
-                    "evidence": evidence + filename_evidence,
-                }
-            return result_from_value(normalized_value, evidence, confident=bool(normalized_value))
+                result["evidence"].extend(filename_evidence)
+                result["evidence"].append(
+                    f"方案文件名日期 `{filename_value}` 与正文 `{normalized_value}` 不一致，以正文为准"
+                )
+            return result
+        if filename_value:
+            return {
+                "status": "uncertain",
+                "value": filename_value,
+                "evidence": filename_evidence
+                + ["注意：版本日期仅从文件名推断，未在方案正文中找到对应字段，请人工确认"],
+            }
         return result_from_value(value, evidence, confident=bool(value))
 
     if item in {"申办者名称", "申办方名称"}:
@@ -745,6 +905,64 @@ def yes_no_polarity(value: str) -> str | None:
     return None
 
 
+def value_matches_expected(actual: str, expected: str) -> bool | None:
+    expected_polarity = yes_no_polarity(expected)
+    if expected_polarity:
+        actual_polarity = yes_no_polarity(actual)
+        if not actual_polarity:
+            return None
+        return actual_polarity == expected_polarity
+
+    actual_norm = norm(actual)
+    expected_norm = norm(expected)
+    if not actual_norm or not expected_norm:
+        return None
+    return expected_norm in actual_norm or actual_norm in expected_norm
+
+
+def evaluate_applicability_condition(condition: str, dm_flat: dict[str, str]) -> dict[str, Any]:
+    condition = as_text(condition)
+    if not condition:
+        return {"status": "applicable", "evidence": []}
+
+    parts = [part.strip() for part in re.split(r"[;；]", condition) if part.strip()]
+    if not parts:
+        return {"status": "applicable", "evidence": []}
+
+    evidence: list[str] = []
+    pending = False
+    for part in parts:
+        match = re.match(r"^(.+?)(?:=|＝|==)(.+)$", part)
+        if not match:
+            pending = True
+            evidence.append(f"适用条件 `{part}` 无法解析，请使用 `字段名=期望值` 格式。")
+            continue
+
+        field = as_text(match.group(1))
+        expected = as_text(match.group(2))
+        result = dm_lookup(field, dm_flat, allow_fuzzy=False)
+        if result["status"] not in {"filled", "uncertain"} or not result.get("value"):
+            pending = True
+            evidence.append(f"适用条件 `{part}` 无法判断：DM日志未提供 `{field}`。")
+            continue
+
+        actual = as_text(result.get("value"))
+        matches = value_matches_expected(actual, expected)
+        evidence.extend(result.get("evidence", []))
+        if matches is None:
+            pending = True
+            evidence.append(f"适用条件 `{part}` 无法判断：`{field}` 当前值为 `{actual}`。")
+        elif not matches:
+            evidence.append(f"适用条件 `{part}` 不成立：`{field}` 当前值为 `{actual}`。")
+            return {"status": "not_applicable", "evidence": evidence}
+        else:
+            evidence.append(f"适用条件 `{part}` 已满足。")
+
+    if pending:
+        return {"status": "condition_pending", "evidence": evidence}
+    return {"status": "applicable", "evidence": evidence}
+
+
 def make_question(row: dict[str, Any], status: str, evidence: list[str]) -> str:
     seq = as_text(row.get("序号"))
     section = as_text(row.get("规则文档章节/应用范围"))
@@ -791,6 +1009,114 @@ def choose_strict_identifier(
     return {"status": "missing", "value": None, "evidence": []}, source_type or "用户确认"
 
 
+def compute_confidence(
+    status: str,
+    value: Any,
+    evidence: list[str],
+    source_used: str,
+    source_type: str,
+    extraction_method: str = "",
+    applicable: bool = True,
+) -> dict[str, Any]:
+    """Compute confidence scores for a trace item.
+
+    Returns dict with extraction_accuracy, completeness, hallucination_risk, overall_confidence.
+    All scores 0-100. Low hallucination_risk = good (evidence-grounded).
+    """
+    # Defaults for non-applicable items
+    if not applicable or status in {"not_applicable", "condition_pending", "not_processed"}:
+        return {
+            "extraction_accuracy": 0,
+            "completeness": 0,
+            "hallucination_risk": 0,
+            "overall_confidence": 0,
+            "extraction_method": extraction_method or "none",
+            "scoring_note": "不适用",
+        }
+
+    # ---- extraction_accuracy ----
+    accuracy = 50  # default
+    if extraction_method == "dm_literal":
+        accuracy = 95
+    elif extraction_method == "dm_lookup":
+        accuracy = 90
+    elif extraction_method == "dm_fuzzy":
+        accuracy = 70
+    elif extraction_method in ("protocol_literal", "table_row"):
+        accuracy = 90
+    elif extraction_method == "protocol_regex":
+        accuracy = 65
+    elif extraction_method == "protocol_keyword":
+        accuracy = 50
+    elif extraction_method == "protocol_search":
+        accuracy = 55
+    elif extraction_method == "combined_fields":
+        accuracy = 85
+    elif extraction_method == "derived":
+        accuracy = 70
+    elif extraction_method == "user_confirm":
+        accuracy = 40
+    elif status == "filled" and not extraction_method:
+        accuracy = 70
+    elif status in {"missing", "uncertain", "conflict", "manual_confirm"}:
+        accuracy = 10
+
+    # ---- completeness ----
+    completeness = 85  # default for filled items
+    if status == "filled":
+        if extraction_method in ("dm_literal", "dm_lookup", "protocol_literal", "table_row"):
+            completeness = 90
+        elif extraction_method in ("dm_fuzzy", "combined_fields"):
+            completeness = 80
+        elif extraction_method in ("protocol_regex", "protocol_keyword", "protocol_search"):
+            completeness = 60
+        elif extraction_method == "derived":
+            completeness = 65
+        elif extraction_method == "user_confirm":
+            completeness = 50
+        # Adjust based on evidence quality
+        evidence_text = " ".join(evidence).lower() if evidence else ""
+        if "截取" in evidence_text or "fragment" in evidence_text:
+            completeness = min(completeness, 50)
+        if "多行" in evidence_text or "multiple" in evidence_text:
+            completeness = min(completeness, 70)
+    elif status in {"uncertain", "conflict"}:
+        completeness = 30
+    elif status in {"missing", "manual_confirm"}:
+        completeness = 10
+
+    # ---- hallucination_risk (inverted: low = good) ----
+    hallucination_risk = 20  # default: low risk for rule-based extraction
+    if evidence:
+        hallucination_risk = 5  # has evidence = very low risk
+        if extraction_method in ("protocol_keyword", "protocol_search"):
+            hallucination_risk = 25  # keyword-based evidence is less precise
+    elif status == "filled" and not evidence:
+        hallucination_risk = 60  # filled but no evidence = suspicious
+    elif status in {"uncertain", "conflict", "manual_confirm"}:
+        hallucination_risk = 40
+    elif status == "missing":
+        hallucination_risk = 70
+    # source_used signals
+    if "AI" in source_used or "推断" in source_used:
+        hallucination_risk = max(hallucination_risk, 60)
+    if "用户确认" in source_used:
+        hallucination_risk = max(hallucination_risk, 50)
+
+    # ---- overall_confidence ----
+    # Weighted: 35% accuracy, 35% completeness, 30% (100 - hallucination_risk)
+    anti_hallucination = max(0, 100 - hallucination_risk)
+    overall = round(accuracy * 0.35 + completeness * 0.35 + anti_hallucination * 0.30)
+
+    return {
+        "extraction_accuracy": accuracy,
+        "completeness": completeness,
+        "hallucination_risk": hallucination_risk,
+        "overall_confidence": overall,
+        "extraction_method": extraction_method,
+    }
+
+
 def resolve_row(
     row: dict[str, Any],
     dm_flat: dict[str, str],
@@ -801,15 +1127,43 @@ def resolve_row(
     item = as_text(row.get("非固定内容"))
     source_type = as_text(row.get("来源类型"))
     granularity = as_text(row.get("判断粒度"))
+    applicability_condition = as_text(row.get("适用条件"))
 
-    dm_result = dm_lookup(item, dm_flat, allow_fuzzy=item not in STRICT_IDENTIFIER_ITEMS)
-    protocol_result = protocol_lookup(item, protocol_text, protocol_lines, protocol_path)
+    applicability = evaluate_applicability_condition(applicability_condition, dm_flat)
+    if applicability["status"] in {"not_applicable", "condition_pending"}:
+        key = re.sub(r"[\s　：:，,。；;；()、/\\_-]+", "_", item).strip("_")
+        confidence = compute_confidence(
+            applicability["status"], None, applicability.get("evidence", []),
+            "适用条件", source_type, applicable=False,
+        )
+        return {
+            "seq": row.get("序号"),
+            "key": key,
+            "section": as_text(row.get("规则文档章节/应用范围")),
+            "topic": as_text(row.get("位置/主题")),
+            "item": item,
+            "granularity": granularity,
+            "rule": as_text(row.get("统一判断/模板选择规则")),
+            "required_content": as_text(row.get("需要填写/替换的具体内容")),
+            "source_type": source_type,
+            "missing_handling": as_text(row.get("缺失时处理")),
+            "applicability_condition": applicability_condition,
+            "status": applicability["status"],
+            "value": None,
+            "source_used": "适用条件",
+            "evidence": applicability.get("evidence", []),
+            "question": None,
+            "confidence": confidence,
+        }
+
+    extraction_method = ""  # tracked for confidence scoring
 
     if item == "页眉":
         required_text = as_text(row.get("需要填写/替换的具体内容"))
         if "DMP版本号" in required_text and "DMP版本日期" in required_text:
             version = dm_lookup("DMP版本号", dm_flat, allow_fuzzy=False)
             version_date = dm_lookup("DMP版本日期", dm_flat, allow_fuzzy=False)
+            extraction_method = "combined_fields"
             if version["status"] == "filled" and version_date["status"] == "filled":
                 selected = {
                     "status": "filled",
@@ -824,6 +1178,7 @@ def resolve_row(
                 }
             source_used = "DM日志"
         elif "申办者" in required_text and "方案编号" in required_text:
+            extraction_method = "combined_fields"
             sponsor = protocol_lookup("申办者名称", protocol_text, protocol_lines, protocol_path)
             protocol_no = protocol_lookup("方案编号", protocol_text, protocol_lines, protocol_path)
             if sponsor["status"] == "filled" and protocol_no["status"] == "filled":
@@ -842,50 +1197,72 @@ def resolve_row(
         else:
             selected = {"status": "not_processed", "value": None, "evidence": []}
             source_used = source_type or "未指定"
-    elif item in STRICT_IDENTIFIER_ITEMS:
-        selected, source_used = choose_strict_identifier(protocol_result, dm_result, source_type)
-    elif source_type == "DM日志":
-        selected = dm_result
+    elif item == "签署页配置":
+        extraction_method = "dm_lookup"
+        selected = dm_lookup("撰写者修订者", dm_flat, allow_fuzzy=False)
         source_used = "DM日志"
-        if dm_result["status"] in {"filled", "uncertain"} and protocol_result["status"] == "filled":
-            if values_conflict(dm_result["value"], protocol_result["value"]):
-                selected = {
-                    "status": "conflict",
-                    "value": None,
-                    "evidence": dm_result["evidence"] + [f"方案线索: {protocol_result['value']}"] + protocol_result["evidence"],
-                }
-                source_used = "DM日志/方案"
-    elif source_type == "方案":
-        selected = protocol_result
-        source_used = "方案"
-        if protocol_result["status"] in {"filled", "uncertain"} and dm_result["status"] == "filled":
-            if values_conflict(protocol_result["value"], dm_result["value"]):
-                selected = {
-                    "status": "conflict",
-                    "value": None,
-                    "evidence": protocol_result["evidence"] + [f"DM日志线索: {dm_result['value']}"] + dm_result["evidence"],
-                }
-                source_used = "方案/DM日志"
-    elif source_type == "暂不处理":
-        selected = {"status": "manual_confirm", "value": dm_result.get("value"), "evidence": dm_result.get("evidence", [])}
-        source_used = "用户确认"
-    elif not source_type and item == "数据录入和质疑模板":
-        mode_result = dm_lookup("项目数据采集模式：EDC / PDC", dm_flat, allow_fuzzy=False)
-        if mode_result["status"] == "filled" and mode_result.get("value"):
-            selected = {
-                "status": "filled",
-                "value": f"{mode_result['value']}模板",
-                "evidence": mode_result.get("evidence", []),
-            }
-        else:
-            selected = {"status": "missing", "value": None, "evidence": mode_result.get("evidence", [])}
-        source_used = "DM日志"
-    elif not source_type and item in {"AI可自动判断的项目特征", "方案与DM日志信息冲突", "方案和DM日志均未提供的信息"}:
-        selected = {"status": "qc_rule", "value": None, "evidence": []}
-        source_used = "QC规则"
     else:
-        selected = {"status": "not_processed", "value": None, "evidence": []}
-        source_used = source_type or "未指定"
+        dm_result = dm_lookup(item, dm_flat, allow_fuzzy=item not in STRICT_IDENTIFIER_ITEMS)
+        protocol_result = protocol_lookup(item, protocol_text, protocol_lines, protocol_path)
+        # Track extraction method based on lookup result quality
+        if dm_result["status"] == "filled":
+            evidence_str = " ".join(dm_result.get("evidence", []))
+            if "近似" in evidence_str:
+                extraction_method = "dm_fuzzy"
+            else:
+                extraction_method = "dm_lookup"
+        elif protocol_result["status"] == "filled":
+            extraction_method = "protocol_regex"
+        else:
+            extraction_method = "search"
+        if item in STRICT_IDENTIFIER_ITEMS:
+            selected, source_used = choose_strict_identifier(protocol_result, dm_result, source_type)
+            extraction_method = "dm_literal" if source_used == "DM日志" else "protocol_literal"
+        elif source_type == "DM日志":
+            selected = dm_result
+            source_used = "DM日志"
+            if dm_result["status"] in {"filled", "uncertain"} and protocol_result["status"] == "filled":
+                if values_conflict(dm_result["value"], protocol_result["value"]):
+                    selected = {
+                        "status": "conflict",
+                        "value": None,
+                        "evidence": dm_result["evidence"] + [f"方案线索: {protocol_result['value']}"] + protocol_result["evidence"],
+                    }
+                    source_used = "DM日志/方案"
+        elif source_type == "方案":
+            selected = protocol_result
+            source_used = "方案"
+            extraction_method = "protocol_regex"
+            if protocol_result["status"] in {"filled", "uncertain"} and dm_result["status"] == "filled":
+                if values_conflict(protocol_result["value"], dm_result["value"]):
+                    selected = {
+                        "status": "conflict",
+                        "value": None,
+                        "evidence": protocol_result["evidence"] + [f"DM日志线索: {dm_result['value']}"] + dm_result["evidence"],
+                    }
+                    source_used = "方案/DM日志"
+        elif source_type == "暂不处理":
+            extraction_method = "user_confirm"
+            selected = {"status": "manual_confirm", "value": dm_result.get("value"), "evidence": dm_result.get("evidence", [])}
+            source_used = "用户确认"
+        elif not source_type and item == "数据录入和质疑模板":
+            extraction_method = "derived"
+            mode_result = dm_lookup("项目数据采集模式：EDC / PDC", dm_flat, allow_fuzzy=False)
+            if mode_result["status"] == "filled" and mode_result.get("value"):
+                selected = {
+                    "status": "filled",
+                    "value": f"{mode_result['value']}模板",
+                    "evidence": mode_result.get("evidence", []),
+                }
+            else:
+                selected = {"status": "missing", "value": None, "evidence": mode_result.get("evidence", [])}
+            source_used = "DM日志"
+        elif not source_type and item in {"AI可自动判断的项目特征", "方案与DM日志信息冲突", "方案和DM日志均未提供的信息"}:
+            selected = {"status": "qc_rule", "value": None, "evidence": []}
+            source_used = "QC规则"
+        else:
+            selected = {"status": "not_processed", "value": None, "evidence": []}
+            source_used = source_type or "未指定"
 
     status = selected["status"]
     question = None
@@ -893,7 +1270,11 @@ def resolve_row(
     if status in {"missing", "uncertain", "conflict", "manual_confirm", "not_processed"} and missing_rule != "NA":
         question = make_question(row, status, selected.get("evidence", []))
 
-    key = re.sub(r"[\s　：:，,。；;（）()、/\\_-]+", "_", item).strip("_")
+    key = re.sub(r"[\s　：:，,。；;；()、/\\_-]+", "_", item).strip("_")
+    confidence = compute_confidence(
+        status, selected.get("value"), selected.get("evidence", []),
+        source_used, source_type, extraction_method, applicable=True,
+    )
     return {
         "seq": row.get("序号"),
         "key": key,
@@ -905,11 +1286,13 @@ def resolve_row(
         "required_content": as_text(row.get("需要填写/替换的具体内容")),
         "source_type": source_type,
         "missing_handling": missing_rule,
+        "applicability_condition": applicability_condition,
         "status": status,
         "value": selected.get("value"),
         "source_used": source_used,
         "evidence": selected.get("evidence", []),
         "question": question,
+        "confidence": confidence,
     }
 
 
@@ -943,6 +1326,7 @@ def main() -> None:
 
     dm_flat, dm_raw, dm_data = read_dm_log(args.dm_log)
     version_records = extract_version_records(dm_data)
+    signature_signers = normalize_signers(extract_signature_signers(dm_data))
 
     dm_entry_count = 1
     if isinstance(dm_data, list):
@@ -994,6 +1378,7 @@ def main() -> None:
             "protected_table_like_sections": PROTECTED_TABLE_LIKE_SECTIONS,
             "version_records": version_records,
             "dm_entry_count": dm_entry_count,
+            "signature_signers": signature_signers,
         },
         "items": items,
         "dm_log_keys": sorted(dm_flat.keys()),

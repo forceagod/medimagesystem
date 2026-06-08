@@ -6,8 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -72,6 +73,11 @@ FIELD_ALIASES = {
     "撰写者修订者": ["撰写者/修订者"],
 }
 
+PLACEHOLDER_TO_FIELD = {
+    **TEXT_PLACEHOLDERS,
+    "请输入版本": "DMP版本号",
+    "请输入姓名": "撰写者修订者",
+}
 
 def norm(value: str) -> str:
     return re.sub(r"[\s　：:，,。；;（）()、/\\_\-]+", "", str(value)).lower()
@@ -130,18 +136,84 @@ def remove_range(doc, start: int, end: int) -> None:
             remove_element(element)
 
 
-def find_block_index(doc, text: str, start: int = 0) -> int | None:
+def _is_toc_paragraph(child) -> bool:
+    """Return True if the element uses a TOC style (toc 1, toc 2, etc.)."""
+    pPr = child.find(qn("w:pPr"))
+    if pPr is None:
+        return False
+    pStyle = pPr.find(qn("w:pStyle"))
+    if pStyle is None:
+        return False
+    style = (pStyle.get(qn("w:val")) or "").lower()
+    return style.startswith("toc")
+
+
+def find_block_index(doc, text: str, start: int = 0, skip_toc: bool = True) -> int | None:
     for index, child in enumerate(body_children(doc)[start:], start=start):
+        if skip_toc and _is_toc_paragraph(child):
+            continue
         if block_text(child) == text:
             return index
     return None
 
 
-def find_next_block_index(doc, texts: set[str], start: int = 0) -> int | None:
+def _matches_numbered_heading(candidate: str, heading: str) -> bool:
+    if candidate == heading:
+        return True
+    pattern = rf"^\s*\d+(?:\.\d+)*\s*{re.escape(heading)}\s*$"
+    return re.match(pattern, candidate) is not None
+
+
+def find_heading_index(doc, heading: str, start: int = 0, skip_toc: bool = True) -> int | None:
+    exact = find_block_index(doc, heading, start, skip_toc)
+    if exact is not None:
+        return exact
     for index, child in enumerate(body_children(doc)[start:], start=start):
-        if block_text(child) in texts:
+        if skip_toc and _is_toc_paragraph(child):
+            continue
+        if _matches_numbered_heading(block_text(child), heading):
             return index
     return None
+
+
+def find_next_block_index(doc, texts: set[str], start: int = 0, skip_toc: bool = True) -> int | None:
+    for index, child in enumerate(body_children(doc)[start:], start=start):
+        if skip_toc and _is_toc_paragraph(child):
+            continue
+        text = block_text(child)
+        if text in texts or any(_matches_numbered_heading(text, expected) for expected in texts):
+            return index
+    return None
+
+
+def end_marker_for(start_marker: str) -> str:
+    return f"{start_marker}END"
+
+
+def end_marker_candidates(start_marker: str) -> set[str]:
+    return {end_marker_for(start_marker), f"{start_marker} END"}
+
+
+def find_end_marker_index(doc, start_marker: str, start_index: int, boundary: int | None = None) -> int:
+    end_markers = end_marker_candidates(start_marker)
+    for index, child in enumerate(body_children(doc)[start_index + 1 :], start=start_index + 1):
+        if boundary is not None and index >= boundary:
+            break
+        if _is_toc_paragraph(child):
+            continue
+        if block_text(child) in end_markers:
+            return index
+    end_marker = end_marker_for(start_marker)
+    raise ValueError(f"Missing END marker `{end_marker}` for template start marker `{start_marker}`.")
+
+
+def remove_selected_directives(doc, marker: str, search_start: int = 0, boundary: int | None = None) -> None:
+    marker_index = find_block_index(doc, marker, search_start)
+    if marker_index is None:
+        return
+    end_index = find_end_marker_index(doc, marker, marker_index, boundary)
+    remove_range(doc, end_index, end_index + 1)
+    remove_range(doc, marker_index, marker_index + 1)
 
 
 def value_is_yes(value: str | None) -> bool:
@@ -211,31 +283,52 @@ def select_pair_after_heading(
     keep_marker: str,
     stop_texts: set[str],
     applied: list[str],
-) -> None:
-    heading_index = find_block_index(doc, heading)
+) -> bool:
+    heading_index = find_heading_index(doc, heading)
     if heading_index is None:
-        return
+        return False
     first_index = find_block_index(doc, first_marker, heading_index + 1)
     if first_index is None:
-        return
+        return False
     second_index = find_block_index(doc, second_marker, first_index + 1)
     if second_index is None:
-        return
+        return False
     stop_index = find_next_block_index(doc, stop_texts, second_index + 1)
-    if stop_index is None:
-        stop_index = len(body_children(doc)) - 1
+
+    # END markers are the authoritative boundary. The old stop heading may now be
+    # inside a selected body block, so only use it to avoid selecting a later section.
+    if stop_index is not None and first_index >= stop_index:
+        return False
+
+    first_end_index = find_end_marker_index(doc, first_marker, first_index)
+    second_end_index = find_end_marker_index(doc, second_marker, second_index)
+    if first_end_index >= second_index:
+        raise ValueError(
+            f"Template block `{first_marker}` END marker appears after the next template start marker `{second_marker}`."
+        )
 
     if keep_marker == first_marker:
-        remove_range(doc, second_index, stop_index)
-        selected_index = find_block_index(doc, first_marker, heading_index + 1)
-        if selected_index is not None:
-            remove_range(doc, selected_index, selected_index + 1)
+        remove_range(doc, second_index, second_end_index + 1)
+        remove_selected_directives(doc, first_marker, heading_index + 1)
     elif keep_marker == second_marker:
-        remove_range(doc, first_index, second_index)
-        selected_index = find_block_index(doc, second_marker, heading_index + 1)
-        if selected_index is not None:
-            remove_range(doc, selected_index, selected_index + 1)
+        remove_range(doc, first_index, first_end_index + 1)
+        remove_selected_directives(doc, second_marker, heading_index + 1)
     applied.append(f"模板选择 `{heading}` -> `{keep_marker}`")
+    return True
+
+
+def select_first_matching_variant(
+    doc,
+    heading: str,
+    variant_pairs: list[tuple[str, str, str]],
+    stop_texts: set[str],
+    applied: list[str],
+) -> bool:
+    """Try each (first_marker, second_marker, keep_marker) variant. Stop after first match."""
+    for first_marker, second_marker, keep_marker in variant_pairs:
+        if select_pair_after_heading(doc, heading, first_marker, second_marker, keep_marker, stop_texts, applied):
+            return True
+    return False
 
 
 def select_alternatives_after_heading(
@@ -246,34 +339,34 @@ def select_alternatives_after_heading(
     stop_texts: set[str],
     applied: list[str],
 ) -> None:
-    heading_index = find_block_index(doc, heading)
+    heading_index = find_heading_index(doc, heading)
     if heading_index is None:
         return
     positions: list[tuple[int, str]] = []
     search_start = heading_index + 1
+    stop_index = find_next_block_index(doc, stop_texts, heading_index + 1)
     for marker in markers:
         index = find_block_index(doc, marker, search_start)
-        if index is not None:
-            positions.append((index, marker))
-            search_start = index + 1
+        if index is None:
+            continue
+        if not positions and stop_index is not None and index >= stop_index:
+            return
+        positions.append((index, marker))
+        search_start = index + 1
     if not positions:
         return
 
-    spans: list[tuple[int, int, str]] = []
-    for pos_index, (start, marker) in enumerate(positions):
-        if pos_index + 1 < len(positions):
-            end = positions[pos_index + 1][0]
-        else:
-            end = find_next_block_index(doc, stop_texts, start + 1) or len(body_children(doc)) - 1
-        spans.append((start, end, marker))
+    spans: list[tuple[int, int, str]] = [
+        (start, find_end_marker_index(doc, marker, start), marker)
+        for start, marker in positions
+    ]
 
     for start, end, marker in reversed(spans):
         if marker != keep_marker:
-            remove_range(doc, start, end)
+            remove_range(doc, start, end + 1)
 
-    selected_index = find_block_index(doc, keep_marker, heading_index + 1)
-    if selected_index is not None:
-        remove_range(doc, selected_index, selected_index + 1)
+    if keep_marker in markers:
+        remove_selected_directives(doc, keep_marker, heading_index + 1)
     applied.append(f"模板选择 `{heading}` -> `{keep_marker}`")
 
 
@@ -287,18 +380,22 @@ def select_simple_marker_block(
 ) -> None:
     start = 0
     if start_after:
-        index = find_block_index(doc, start_after)
+        index = find_heading_index(doc, start_after)
         if index is not None:
             start = index + 1
     marker_index = find_block_index(doc, marker, start)
     if marker_index is None:
         return
+    stop_index = find_next_block_index(doc, stop_texts, start)
+    if stop_index is not None and marker_index >= stop_index:
+        return
+    end_index = find_end_marker_index(doc, marker, marker_index)
     if keep:
+        remove_range(doc, end_index, end_index + 1)
         remove_range(doc, marker_index, marker_index + 1)
         applied.append(f"模板标记清理 `{marker}`")
         return
-    stop_index = find_next_block_index(doc, stop_texts, marker_index + 1) or len(body_children(doc)) - 1
-    remove_range(doc, marker_index, stop_index)
+    remove_range(doc, marker_index, end_index + 1)
     applied.append(f"模板删除 `{marker}`")
 
 
@@ -460,8 +557,8 @@ def fill_text_placeholders(doc, values: dict[str, str], applied: list[str]) -> N
             applied.append("文本占位替换 <- " + ",".join(dict.fromkeys(applied_items)))
 
 
-def fill_signature_writer(doc, values: dict[str, str], applied: list[str]) -> None:
-    writer = value_for(values, "撰写者修订者")
+def fill_signature_writer(doc, values: dict[str, str], applied: list[str], writer_override: str | None = None) -> None:
+    writer = writer_override or value_for(values, "撰写者修订者")
     if not writer:
         return
     replacements = 0
@@ -486,7 +583,37 @@ def fill_signature_writer(doc, values: dict[str, str], applied: list[str]) -> No
         set_paragraph_text(paragraph, new_text)
         replacements += 1
     if replacements:
-        applied.append(f"签署页撰写人 <- 撰写者修订者 ({replacements}处)")
+        source = "撰写人" if writer_override else "撰写者修订者"
+        applied.append(f"签署页撰写人 <- {source} ({replacements}处)")
+
+
+def fill_signature_reviewers(doc, signers: dict, applied: list[str]) -> list[dict[str, str]]:
+    reviewers = (signers or {}).get("reviewers") or {}
+    missing: list[dict[str, str]] = []
+    if not reviewers:
+        return missing
+
+    for placeholder_key, info in reviewers.items():
+        role = (info.get("role") or "").strip()
+        name = (info.get("name") or "").strip()
+        pattern = re.compile(r"(审核人\s*[：:])\s*" + re.escape(placeholder_key) + r"\s*$")
+        replaced = False
+        for paragraph in doc.paragraphs:
+            text = paragraph.text
+            if not pattern.search(text):
+                continue
+            if name:
+                new_text = pattern.sub(lambda match: match.group(1) + name, text)
+                set_paragraph_text(paragraph, new_text)
+                applied.append(f"签署页审核人 `{placeholder_key}` <- {role} ({name})")
+            else:
+                new_text = pattern.sub(lambda match: match.group(1) + f"[待补-{role}]", text)
+                set_paragraph_text(paragraph, new_text)
+                missing.append({"placeholder": placeholder_key, "role": role})
+            replaced = True
+        if not replaced and name:
+            applied.append(f"签署页审核人占位符 `{placeholder_key}` 未在模板中找到")
+    return missing
 
 
 def fill_trial_overview(doc, values: dict[str, str], applied: list[str]) -> None:
@@ -621,6 +748,96 @@ def fill_targeted_sentences(doc, values: dict[str, str], applied: list[str]) -> 
             set_paragraph_text(paragraph, new_text)
 
 
+def ensure_suffix(value: str, suffix: str) -> str:
+    text = value.strip()
+    if not text or text.endswith(suffix):
+        return text
+    return f"{text}{suffix}"
+
+
+def iter_body_paragraphs_between(doc, heading: str, stop_texts: set[str]) -> Iterable:
+    heading_index = find_heading_index(doc, heading)
+    if heading_index is None:
+        return
+    stop_index = find_next_block_index(doc, stop_texts, heading_index + 1)
+    if stop_index is None:
+        stop_index = len(body_children(doc))
+
+    paragraph_index = -1
+    for child_index, child in enumerate(body_children(doc)):
+        if child.tag != qn("w:p"):
+            continue
+        paragraph_index += 1
+        if heading_index < child_index < stop_index:
+            yield doc.paragraphs[paragraph_index]
+
+
+def apply_replacements_to_paragraph(
+    paragraph,
+    values: dict[str, str],
+    replacement_specs: list[tuple[str, str, Callable[[str], str]]],
+    label: str,
+    applied: list[str],
+) -> None:
+    original = paragraph.text
+    new_text = original
+    applied_fields: list[str] = []
+    for marker, field_name, formatter in replacement_specs:
+        value = value_for(values, field_name)
+        if value and marker in new_text:
+            new_text = new_text.replace(marker, formatter(value))
+            applied_fields.append(field_name)
+    if new_text != original:
+        set_paragraph_text(paragraph, new_text)
+        applied.append(f"其他系统字段替换 `{label}` <- {','.join(dict.fromkeys(applied_fields))}")
+
+
+def fill_other_system_placeholders(doc, values: dict[str, str], applied: list[str]) -> None:
+    edc_replacements = [
+        (
+            "XXXXX公司（以下简称EDC系统供应商）",
+            "EDC其他系统供应商名称",
+            lambda value: f"{value}（以下简称EDC系统供应商）",
+        ),
+        (
+            "XXXXX系统进行数据管理",
+            "EDC其他系统名称",
+            lambda value: f"{ensure_suffix(value, '系统')}进行数据管理",
+        ),
+        (
+            "系统的维护由XXXXX公司负责",
+            "EDC其他系统维护负责方",
+            lambda value: f"系统的维护由{value}负责",
+        ),
+        ("EDC版本号：XXXXX", "EDC其他系统版本号", lambda value: f"EDC版本号：{value}"),
+        ("服务器地址：XXXXX", "EDC其他系统服务器地址", lambda value: f"服务器地址：{value}"),
+    ]
+    for paragraph in iter_body_paragraphs_between(doc, "数据管理系统", {"用户权限定义"}):
+        apply_replacements_to_paragraph(paragraph, values, edc_replacements, "7.3 EDC其他系统", applied)
+
+    random_replacements = [
+        (
+            "XXXXX公司提供的中央随机化管理系统",
+            "随机其他系统供应商名称",
+            lambda value: f"{value}提供的中央随机化管理系统",
+        ),
+        (
+            "系统的搭建由XXXXX公司负责",
+            "随机其他系统搭建负责方",
+            lambda value: f"系统的搭建由{value}负责",
+        ),
+        (
+            "系统的维护由XXXXX公司负责",
+            "随机其他系统维护负责方",
+            lambda value: f"系统的维护由{value}负责",
+        ),
+        ("随机系统版本号：XXXXX", "随机其他系统版本号", lambda value: f"随机系统版本号：{value}"),
+        ("服务器地址：XXXXX", "随机其他系统服务器地址", lambda value: f"服务器地址：{value}"),
+    ]
+    for paragraph in iter_body_paragraphs_between(doc, "随机系统", {"用户权限定义", "数据管理里程碑"}):
+        apply_replacements_to_paragraph(paragraph, values, random_replacements, "8.1 随机其他系统", applied)
+
+
 def clean_toc_template_labels(doc, values: dict[str, str], applied: list[str]) -> None:
     use_registry = value_is_yes(value_for(values, "是否使用登记系统"))
     use_random = value_is_yes(value_for(values, "是否使用随机系统"))
@@ -702,7 +919,7 @@ def apply_template_selection(doc, values: dict[str, str], applied: list[str]) ->
         )
         select_pair_after_heading(
             doc,
-            "数据采集方式",
+            "数据采集/管理系统",
             "/模版1/适用于PDC项目",
             "/模版2/适用于EDC项目",
             "/模版2/适用于EDC项目",
@@ -722,6 +939,7 @@ def apply_template_selection(doc, values: dict[str, str], applied: list[str]) ->
         for heading, stop in [
             ("EDC系统基本信息设置", {"EDC动态规则设置"}),
             ("EDC动态规则设置", {"EDC核查规则配置"}),
+            ("EDC核查规则配置", {"系统培训和账号管理"}),
             ("系统培训和账号管理", {"UAT"}),
             ("UAT", {"数据库上线"}),
             ("数据库上线", {"数据库更新"}),
@@ -732,39 +950,15 @@ def apply_template_selection(doc, values: dict[str, str], applied: list[str]) ->
             ("数据库锁定", {"数据库解锁"}),
             ("数据库解锁", {"向统计部门数据递交"}),
         ]:
-            select_pair_after_heading(
+            select_first_matching_variant(
                 doc,
                 heading,
-                "/*模版1：PDC项目适用)*/",
-                "/*模版2：EDC项目适用)*/",
-                "/*模版2：EDC项目适用)*/",
-                stop,
-                applied,
-            )
-            select_pair_after_heading(
-                doc,
-                heading,
-                "/*模版1(PDC项目适用)*/",
-                "/*模版2(EDC项目适用)*/",
-                "/*模版2(EDC项目适用)*/",
-                stop,
-                applied,
-            )
-            select_pair_after_heading(
-                doc,
-                heading,
-                "/*模版1*/(PDC项目适用)",
-                "/*模版2*/(EDC项目适用)",
-                "/*模版2*/(EDC项目适用)",
-                stop,
-                applied,
-            )
-            select_pair_after_heading(
-                doc,
-                heading,
-                "/*模版1*/（适用于PDC项目）",
-                "/*模版2*/（适用于EDC项目）",
-                "/*模版2*/（适用于EDC项目）",
+                [
+                    ("/*模版1：PDC项目适用)*/", "/*模版2：EDC项目适用)*/", "/*模版2：EDC项目适用)*/"),
+                    ("/*模版1(PDC项目适用)*/", "/*模版2(EDC项目适用)*/", "/*模版2(EDC项目适用)*/"),
+                    ("/*模版1*/(PDC项目适用)", "/*模版2*/(EDC项目适用)", "/*模版2*/(EDC项目适用)"),
+                    ("/*模版1*/（适用于PDC项目）", "/*模版2*/（适用于EDC项目）", "/*模版2*/（适用于EDC项目）"),
+                ],
                 stop,
                 applied,
             )
@@ -781,13 +975,49 @@ def apply_template_selection(doc, values: dict[str, str], applied: list[str]) ->
         )
         select_pair_after_heading(
             doc,
-            "数据采集方式",
+            "数据采集/管理系统",
             "/模版1/适用于PDC项目",
             "/模版2/适用于EDC项目",
             "/模版1/适用于PDC项目",
             {"数据库项目创建"},
             applied,
         )
+        for heading in ["CRF设计/审核", "eCRF/ 注释CRF设计", "eCRF填写指南"]:
+            select_pair_after_heading(
+                doc,
+                heading,
+                "/模版1/适用于PDC项目",
+                "/模版2/适用于EDC项目",
+                "/模版1/适用于PDC项目",
+                {"eCRF/ 注释CRF设计", "eCRF填写指南", "数据核查计划"},
+                applied,
+            )
+        for heading, stop in [
+            ("EDC系统基本信息设置", {"EDC动态规则设置"}),
+            ("EDC动态规则设置", {"EDC核查规则配置"}),
+            ("EDC核查规则配置", {"系统培训和账号管理"}),
+            ("系统培训和账号管理", {"UAT"}),
+            ("UAT", {"数据库上线"}),
+            ("数据库上线", {"数据库更新"}),
+            ("数据库更新", {"数据录入"}),
+            ("数据录入", {"数据质疑"}),
+            ("数据质疑", {"外部数据管理"}),
+            ("沟通频率及进度报告", {"提供数据管理单位文件"}),
+            ("数据库锁定", {"数据库解锁"}),
+            ("数据库解锁", {"向统计部门数据递交"}),
+        ]:
+            select_first_matching_variant(
+                doc,
+                heading,
+                [
+                    ("/*模版1：PDC项目适用)*/", "/*模版2：EDC项目适用)*/", "/*模版1：PDC项目适用)*/"),
+                    ("/*模版1(PDC项目适用)*/", "/*模版2(EDC项目适用)*/", "/*模版1(PDC项目适用)*/"),
+                    ("/*模版1*/(PDC项目适用)", "/*模版2*/(EDC项目适用)", "/*模版1*/(PDC项目适用)"),
+                    ("/*模版1*/（适用于PDC项目）", "/*模版2*/（适用于EDC项目）", "/*模版1*/（适用于PDC项目）"),
+                ],
+                stop,
+                applied,
+            )
 
     edc_marker = choose_edc_system_marker(values)
     if edc_marker:
@@ -805,6 +1035,23 @@ def apply_template_selection(doc, values: dict[str, str], applied: list[str]) ->
                 "/模板7/其他系统",
             ],
             edc_marker,
+            {"用户权限定义"},
+            applied,
+        )
+    else:
+        select_alternatives_after_heading(
+            doc,
+            "数据管理系统",
+            [
+                "/模板1/赛美斯系统",
+                "/模板2/青蜂系统",
+                "/模板3/里恩系统",
+                "/模板4/太美系统V5",
+                "/模板5/太美系统V6",
+                "/模板6/易迪希系统",
+                "/模板7/其他系统",
+            ],
+            "__NO_EDC_SYSTEM__",
             {"用户权限定义"},
             applied,
         )
@@ -923,6 +1170,209 @@ def unresolved_items(trace: dict) -> list[dict]:
     ]
 
 
+def _locate_cover_and_signature_blocks(doc) -> dict[str, list]:
+    children = body_children(doc)
+    cover_paragraphs: list = []
+    cover_tables: list = []
+    signature_paragraphs: list = []
+    signature_tables: list = []
+
+    signature_start = None
+    for index, child in enumerate(children):
+        if child.tag == qn("w:p") and block_text(child) == "签署页":
+            signature_start = index
+            break
+    if signature_start is None:
+        return {
+            "cover_paragraphs": [],
+            "cover_tables": [],
+            "signature_paragraphs": [],
+            "signature_tables": [],
+        }
+
+    signature_end = len(children)
+    for index in range(signature_start + 1, len(children)):
+        child = children[index]
+        if child.tag == qn("w:p") and block_text(child) == "目录":
+            signature_end = index
+            break
+
+    paragraph_index = -1
+    table_index = -1
+    for index, child in enumerate(children):
+        if child.tag == qn("w:p"):
+            paragraph_index += 1
+            if index < signature_start:
+                cover_paragraphs.append(doc.paragraphs[paragraph_index])
+            elif signature_start <= index < signature_end:
+                signature_paragraphs.append(doc.paragraphs[paragraph_index])
+        elif child.tag == qn("w:tbl"):
+            table_index += 1
+            if table_index >= len(doc.tables):
+                continue
+            if index < signature_start:
+                cover_tables.append(doc.tables[table_index])
+            elif signature_start <= index < signature_end:
+                signature_tables.append(doc.tables[table_index])
+
+    return {
+        "cover_paragraphs": cover_paragraphs,
+        "cover_tables": cover_tables,
+        "signature_paragraphs": signature_paragraphs,
+        "signature_tables": signature_tables,
+    }
+
+
+def _collect_placeholders_in_region(paragraphs: list, tables: list) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def scan(text: str, context: str) -> None:
+        for match in _RE_PLEASE_INPUT.finditer(text or ""):
+            placeholder = match.group()
+            key = (placeholder, context)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append((placeholder, context))
+
+    for paragraph in paragraphs:
+        text = paragraph.text or ""
+        if "请输入" in text:
+            scan(text, text.strip()[:60])
+
+    for table in tables:
+        for row in table.rows:
+            cells = [cell_text(cell) for cell in row.cells]
+            row_context = " | ".join(cell for cell in cells if cell)[:80]
+            for cell_value in cells:
+                if "请输入" in cell_value:
+                    scan(cell_value, row_context or cell_value.strip()[:60])
+    return findings
+
+
+def _retry_lookup_value(placeholder: str, values: dict[str, str]) -> str | None:
+    field_key = PLACEHOLDER_TO_FIELD.get(placeholder)
+    if field_key:
+        value = value_for(values, field_key)
+        if value:
+            return value
+
+    hint = placeholder[3:] if placeholder.startswith("请输入") else placeholder
+    if not hint:
+        return None
+    item_key = _HINT_REVERSE_MAP.get(norm(hint))
+    if item_key:
+        value = value_for(values, item_key)
+        if value:
+            return value
+
+    hint_norm = norm(hint)
+    for key, value in values.items():
+        if not value:
+            continue
+        key_norm = norm(key)
+        if hint_norm and (hint_norm in key_norm or key_norm in hint_norm):
+            return value
+    return None
+
+
+def validate_and_retry_placeholders(
+    doc,
+    values: dict[str, str],
+    applied: list[str],
+    missing_reviewers: list[dict[str, str]],
+    template_label: str,
+) -> list[dict[str, str]]:
+    blocks = _locate_cover_and_signature_blocks(doc)
+    warnings: list[dict[str, str]] = []
+
+    region_specs = [
+        ("封面", blocks["cover_paragraphs"], blocks["cover_tables"]),
+        ("签署页", blocks["signature_paragraphs"], blocks["signature_tables"]),
+    ]
+
+    for region_name, paragraphs, tables in region_specs:
+        if not _collect_placeholders_in_region(paragraphs, tables):
+            continue
+
+        for paragraph in paragraphs:
+            original = paragraph.text or ""
+            if "请输入" not in original:
+                continue
+            new_text = original
+            replaced_hits: list[str] = []
+            for match in list(_RE_PLEASE_INPUT.finditer(original)):
+                placeholder = match.group()
+                value = _retry_lookup_value(placeholder, values)
+                if value:
+                    new_text = new_text.replace(placeholder, value)
+                    replaced_hits.append(placeholder)
+            if new_text != original and replaced_hits:
+                set_paragraph_text(paragraph, new_text)
+                applied.append(f"二次抓取占位符 [{region_name}] {','.join(dict.fromkeys(replaced_hits))}")
+
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    original = cell_text(cell)
+                    if "请输入" not in original:
+                        continue
+                    new_text = original
+                    replaced_hits: list[str] = []
+                    for match in list(_RE_PLEASE_INPUT.finditer(original)):
+                        placeholder = match.group()
+                        value = _retry_lookup_value(placeholder, values)
+                        if value:
+                            new_text = new_text.replace(placeholder, value)
+                            replaced_hits.append(placeholder)
+                    if new_text != original and replaced_hits:
+                        set_cell_text(cell, new_text)
+                        applied.append(f"二次抓取占位符 [{region_name}] {','.join(dict.fromkeys(replaced_hits))}")
+
+        for placeholder, context in _collect_placeholders_in_region(paragraphs, tables):
+            field = PLACEHOLDER_TO_FIELD.get(placeholder)
+            warnings.append(
+                {
+                    "template": template_label,
+                    "region": region_name,
+                    "placeholder": placeholder,
+                    "missing_field": field or placeholder.replace("请输入", "").strip() or placeholder,
+                    "context": context,
+                }
+            )
+
+    for entry in missing_reviewers:
+        warnings.append(
+            {
+                "template": template_label,
+                "region": "签署页",
+                "placeholder": entry.get("placeholder", ""),
+                "missing_field": f"{entry.get('role', '')}-姓名",
+                "context": f"审核人占位符 {entry.get('placeholder', '')}",
+            }
+        )
+
+    return warnings
+
+
+def print_warning_log(warnings: list[dict[str, str]]) -> None:
+    header = "===== 需人工补全的占位符（封面 / 签署页） ====="
+    print(header, file=sys.stderr)
+    if not warnings:
+        print("- 未发现需人工补全的占位符。", file=sys.stderr)
+        print("=" * len(header), file=sys.stderr)
+        return
+    for warning in warnings:
+        print(
+            f"[{warning.get('template', '未知模板')}] - {warning.get('region', '')} - "
+            f"缺失{warning.get('missing_field', '')}（占位符：{warning.get('placeholder', '')}；"
+            f"位置：{warning.get('context', '')}）",
+            file=sys.stderr,
+        )
+    print("=" * len(header), file=sys.stderr)
+
+
 def write_report(path: Path, trace: dict, values: dict[str, str], applied: list[str], doc) -> None:
     applied_items = set()
     for line in applied:
@@ -931,6 +1381,8 @@ def write_report(path: Path, trace: dict, values: dict[str, str], applied: list[
                 applied_items.add(item)
         if line.startswith("版本修订记录表 <-"):
             applied_items.update({"DMP版本号", "DMP版本日期", "版本号", "版本日期", "版本修订记录", "撰写者修订者"})
+        if line.startswith("签署页撰写人 <-"):
+            applied_items.update({"签署页配置", "撰写者修订者"})
         if line == "模板判断已处理 <- 项目数据采集模式：EDC / PDC":
             applied_items.add("数据录入和质疑模板")
 
@@ -961,7 +1413,207 @@ def write_report(path: Path, trace: dict, values: dict[str, str], applied: list[
     if not unresolved:
         lines.append("- 无")
 
+    # ---- Confidence summary ----
+    items = trace.get("items", [])
+    filled_with_conf = [
+        i for i in items
+        if i.get("status") == "filled" and i.get("confidence", {}).get("overall_confidence", 0) > 0
+    ]
+    if filled_with_conf:
+        high = [i for i in filled_with_conf if i["confidence"]["overall_confidence"] >= 80]
+        mid = [i for i in filled_with_conf if 50 <= i["confidence"]["overall_confidence"] < 80]
+        low = [i for i in filled_with_conf if i["confidence"]["overall_confidence"] < 50]
+
+        lines.extend(["", "## 填充置信度汇总", ""])
+        lines.append("| 评分区间 | 项数 | 建议 |")
+        lines.append("|---|---|---|")
+        lines.append(f"| >= 80 分（绿色/可信） | {len(high)} | 可直接使用 |")
+        lines.append(f"| 50-79 分（黄色/需审核） | {len(mid)} | 建议人工核对 |")
+        lines.append(f"| < 50 分（红色/不可信） | {len(low)} | 必须人工修正 |")
+
+        if low:
+            lines.extend(["", "### 低分项明细（< 50 分）", ""])
+            lines.append("| 章节 | 字段 | 准确性 | 完整性 | 幻觉风险 | 综合 | 说明 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for item in low:
+                conf = item.get("confidence", {})
+                lines.append(
+                    f"| {item.get('section','')} | {item.get('item','')} | "
+                    f"{conf.get('extraction_accuracy','?')} | {conf.get('completeness','?')} | "
+                    f"{conf.get('hallucination_risk','?')} | **{conf.get('overall_confidence','?')}** | "
+                    f"{conf.get('scoring_note','')} |"
+                )
+
+        if mid:
+            lines.extend(["", "### 中分项明细（50-79 分）", ""])
+            lines.append("| 章节 | 字段 | 准确性 | 完整性 | 幻觉风险 | 综合 | 提取方式 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for item in mid:
+                conf = item.get("confidence", {})
+                lines.append(
+                    f"| {item.get('section','')} | {item.get('item','')} | "
+                    f"{conf.get('extraction_accuracy','?')} | {conf.get('completeness','?')} | "
+                    f"{conf.get('hallucination_risk','?')} | **{conf.get('overall_confidence','?')}** | "
+                    f"{conf.get('extraction_method','')} |"
+                )
+
     path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+
+
+def generate_annotated_docx(
+    doc_path: Path, trace: dict, annotated_path: Path
+) -> None:
+    """Generate a confidence-annotated copy of the DMP docx.
+
+    Adds color highlights (green/yellow/red) based on overall_confidence.
+    """
+    from docx import Document
+    from docx.shared import RGBColor
+    from docx.oxml.ns import qn, nsdecls
+    from docx.oxml import parse_xml
+    from lxml import etree
+
+    doc = Document(str(doc_path))
+    items = trace.get("items", [])
+
+    # Build lookup: value text -> confidence info
+    # Only items with status=filled and non-zero confidence
+    conf_map: dict[str, dict] = {}
+    for item in items:
+        if item.get("status") != "filled":
+            continue
+        value = item.get("value")
+        if not value or not str(value).strip():
+            continue
+        conf = item.get("confidence", {})
+        overall = conf.get("overall_confidence", 0)
+        if overall <= 0:
+            continue
+        value_str = str(value).strip()
+        # Use first 30 chars as lookup key
+        key = value_str[:30]
+        if key not in conf_map:
+            conf_map[key] = {
+                "item": item.get("item", ""),
+                "value": value_str,
+                "overall": overall,
+                "accuracy": conf.get("extraction_accuracy", 0),
+                "completeness": conf.get("completeness", 0),
+                "hallucination": conf.get("hallucination_risk", 0),
+                "method": conf.get("extraction_method", ""),
+                "evidence": ", ".join(item.get("evidence", [])[:2]),
+                "note": conf.get("scoring_note", ""),
+            }
+
+    if not conf_map:
+        print("No confidence data to annotate.")
+        return
+
+    # Tier colors: green >= 80, yellow 50-79, red < 50
+    def tier_color(score: int) -> str:
+        if score >= 80:
+            return "70AD47"  # green
+        elif score >= 50:
+            return "FFC000"  # yellow/amber
+        return "FF4444"  # red
+
+    def tier_label(score: int) -> str:
+        if score >= 80:
+            return "可信"
+        elif score >= 50:
+            return "需审核"
+        return "不可信"
+
+    annotations_added = 0
+
+    # Search paragraphs for filled values and annotate
+    for para in doc.paragraphs:
+        para_text = para.text
+        for key, info in conf_map.items():
+            if key in para_text and len(key) >= 4:
+                # Find the exact run and apply color
+                full_text = para.text
+                idx = full_text.find(key)
+                if idx < 0:
+                    continue
+
+                # Rebuild paragraph runs with highlighting
+                _annotate_paragraph(para, key, info, tier_color, tier_label)
+                annotations_added += 1
+                break  # one annotation per paragraph
+
+    # Also search table cells
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    para_text = para.text
+                    for key, info in conf_map.items():
+                        if key in para_text and len(key) >= 4:
+                            _annotate_paragraph(para, key, info, tier_color, tier_label)
+                            annotations_added += 1
+                            break
+
+    # Add a legend page at the beginning (as a new first section)
+    _add_confidence_legend(doc)
+
+    annotated_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(annotated_path))
+    print(f"Annotated docx saved ({annotations_added} annotations)")
+
+
+def _annotate_paragraph(para, key: str, info: dict, tier_color_fn, tier_label_fn) -> None:
+    """Apply confidence annotation to a paragraph by modifying its runs."""
+    from docx.shared import RGBColor
+    from docx.oxml.ns import qn
+    from docx.oxml import parse_xml
+
+    color = tier_color_fn(info["overall"])
+    label = tier_label_fn(info["overall"])
+    badge = f" [{label} {info['overall']}%]"
+
+    # Simple approach: add badge text with color at end of paragraph
+    # For more precise highlighting, we'd need to split runs at the key position
+    run = para.add_run(badge)
+    run.font.size = Pt(7)
+    run.font.color.rgb = RGBColor.from_string(color)
+    run.font.bold = True
+
+
+def _add_confidence_legend(doc) -> None:
+    """Add a confidence legend as the first page."""
+    from docx.shared import RGBColor, Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    # Insert a section break for the legend page
+    # Actually, insert at the beginning is complex. Add as a new paragraph at the top.
+    first_para = doc.paragraphs[0] if doc.paragraphs else None
+
+    # Add a separator before legend
+    legend_texts = [
+        ("置信度标注说明", 16, True, None),
+        ("", 10, False, None),
+        ("绿色高亮 [可信 ≥80]：值直接从结构化来源提取，准确完整，可直接使用。", 10, False, "70AD47"),
+        ("黄色高亮 [需审核 50-79]：值经规则或AI提取，建议人工核对完整性。", 10, False, "FFC000"),
+        ("红色高亮 [不可信 <50]：值缺失、不确定或来自推断，必须人工修正。", 10, False, "FF4444"),
+        ("", 10, False, None),
+        ("评分维度：准确性(extraction_accuracy) / 完整性(completeness) / 幻觉风险(hallucination_risk)", 8, False, None),
+        ("生成时间：" + str(doc.core_properties.modified or ""), 8, False, None),
+        ("", 10, False, None),
+        ("=" * 60, 10, False, None),
+        ("", 10, False, None),
+    ]
+
+    # Insert legend at the beginning
+    if first_para:
+        for text, size, bold, color in reversed(legend_texts):
+            new_para = first_para.insert_paragraph_before(text, style=None)
+            if text:
+                for run in new_para.runs:
+                    run.font.size = Pt(size)
+                    run.font.bold = bold
+                    if color:
+                        run.font.color.rgb = RGBColor.from_string(color)
 
 
 def main() -> None:
@@ -970,6 +1622,7 @@ def main() -> None:
     parser.add_argument("--trace", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--annotated", action="store_true", help="生成置信度标注版docx")
     args = parser.parse_args()
 
     from docx import Document
@@ -982,28 +1635,48 @@ def main() -> None:
     template_path = Path(template_value)
     doc = Document(template_path)
     applied: list[str] = []
+    signature_signers = (trace.get("metadata", {}) or {}).get("signature_signers") or {}
+    writer_override = (signature_signers.get("writer") or "").strip() or None
 
     apply_template_selection(doc, values, applied)
     clean_toc_template_labels(doc, values, applied)
     fill_inline_table_template_options(doc, values, applied)
     fill_text_placeholders(doc, values, applied)
-    fill_signature_writer(doc, values, applied)
+    fill_signature_writer(doc, values, applied, writer_override=writer_override)
+    missing_reviewers = fill_signature_reviewers(doc, signature_signers, applied)
     fill_label_paragraphs(doc, values, applied)
     fill_label_cells(doc, values, applied)
     fill_trial_overview(doc, values, applied)
     fill_revision_table(doc, trace, values, applied)
     fill_targeted_sentences(doc, values, applied)
+    fill_other_system_placeholders(doc, values, applied)
+    placeholder_warnings = validate_and_retry_placeholders(
+        doc, values, applied, missing_reviewers, template_path.stem
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     doc.save(args.out)
+
+    # Generate annotated version if requested
+    if args.annotated:
+        annotated_path = args.out.parent / args.out.name.replace(".docx", "标注版.docx")
+        generate_annotated_docx(args.out, trace, annotated_path)
 
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         write_report(args.report, trace, values, applied, doc)
 
+    print_warning_log(placeholder_warnings)
+
     print(
         json.dumps(
-            {"applied": len(applied), "filled_values": len(values), "template": str(template_path), "out": str(args.out)},
+            {
+                "applied": len(applied),
+                "filled_values": len(values),
+                "template": str(template_path),
+                "out": str(args.out),
+                "warnings": len(placeholder_warnings),
+            },
             ensure_ascii=False,
         )
     )
